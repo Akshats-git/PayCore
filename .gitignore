@@ -1,0 +1,21 @@
+# Compiled binaries
+/bin/
+/paycore
+*.exe
+
+# Go test & coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Local environment / secrets
+.env
+.env.local
+
+# Editor / OS noise
+.DS_Store
+.idea/
+
+# Local project docs (kept out of the public repo by preference)
+SPEC.md
+BLOG.md
