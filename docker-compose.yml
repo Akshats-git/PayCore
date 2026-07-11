@@ -1,0 +1,40 @@
+# Local infrastructure for PayCore: Postgres (the ledger's source of truth) and
+# Redis (fast atomic ops for rate limiting later). Bring both up with:
+#
+#   docker compose up -d
+#
+# then run the service on the host with `go run ./cmd/server`. The default
+# config in internal/config points at these ports and credentials.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: paycore
+      POSTGRES_PASSWORD: paycore
+      POSTGRES_DB: paycore
+    ports:
+      # host 5433 -> container 5432. We use 5433 on the host because 5432 is
+      # often already taken by a local Postgres; the container still listens on
+      # the standard 5432 internally.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Compose can wait for this to pass before reporting the service healthy.
+      test: ["CMD-SHELL", "pg_isready -U paycore -d paycore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
