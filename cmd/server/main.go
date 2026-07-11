@@ -15,6 +15,7 @@ import (
 	"github.com/Akshats-git/PayCore/internal/config"
 	"github.com/Akshats-git/PayCore/internal/httpapi"
 	"github.com/Akshats-git/PayCore/internal/storage"
+	"github.com/Akshats-git/PayCore/migrations"
 )
 
 func main() {
@@ -43,6 +44,13 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 	logger.Info("connected to postgres")
+
+	// Apply any pending schema migrations before serving traffic. On a fresh
+	// database this creates the ledger tables; on an up-to-date one it's a no-op.
+	if err := storage.RunMigrations(cfg.DatabaseURL, migrations.FS); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	}
+	logger.Info("migrations applied")
 
 	rdb, err := storage.NewRedisClient(startupCtx, cfg.RedisURL)
 	if err != nil {
