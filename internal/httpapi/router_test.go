@@ -21,9 +21,12 @@ func discardLogger() *slog.Logger {
 // alwaysReady is a ReadinessFunc that always reports the service is healthy.
 func alwaysReady(context.Context) error { return nil }
 
+// healthRouter builds a router with just the dependencies the health tests need.
+func healthRouter(ready ReadinessFunc) http.Handler {
+	return NewRouter(Deps{Logger: discardLogger(), Ready: ready})
+}
+
 // get performs an in-memory request against the router and returns the recorder.
-// Using httptest.NewRecorder means we never open a real network port, so tests
-// are fast and deterministic.
 func get(t *testing.T, router http.Handler, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, nil)
@@ -34,7 +37,7 @@ func get(t *testing.T, router http.Handler, method, path string) *httptest.Respo
 
 // TestHealthz asserts the liveness endpoint returns 200 and the expected body.
 func TestHealthz(t *testing.T) {
-	rec := get(t, NewRouter(discardLogger(), alwaysReady), http.MethodGet, "/healthz")
+	rec := get(t, healthRouter(alwaysReady), http.MethodGet, "/healthz")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -47,7 +50,7 @@ func TestHealthz(t *testing.T) {
 // TestHealthzMethodNotAllowed documents that the method-aware router rejects a
 // POST to a GET-only route with 405, with no extra code from us.
 func TestHealthzMethodNotAllowed(t *testing.T) {
-	rec := get(t, NewRouter(discardLogger(), alwaysReady), http.MethodPost, "/healthz")
+	rec := get(t, healthRouter(alwaysReady), http.MethodPost, "/healthz")
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
@@ -56,7 +59,7 @@ func TestHealthzMethodNotAllowed(t *testing.T) {
 
 // TestReadyz asserts that when dependencies are reachable, readyz returns 200.
 func TestReadyz(t *testing.T) {
-	rec := get(t, NewRouter(discardLogger(), alwaysReady), http.MethodGet, "/readyz")
+	rec := get(t, healthRouter(alwaysReady), http.MethodGet, "/readyz")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -67,11 +70,10 @@ func TestReadyz(t *testing.T) {
 }
 
 // TestReadyzUnavailable asserts that when a dependency is down, readyz returns
-// 503 — the signal a load balancer uses to stop routing traffic to this
-// instance without restarting it.
+// 503 — the signal a load balancer uses to stop routing traffic to this instance.
 func TestReadyzUnavailable(t *testing.T) {
 	notReady := func(context.Context) error { return errors.New("postgres: connection refused") }
-	rec := get(t, NewRouter(discardLogger(), notReady), http.MethodGet, "/readyz")
+	rec := get(t, healthRouter(notReady), http.MethodGet, "/readyz")
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)

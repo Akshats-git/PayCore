@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Akshats-git/PayCore/internal/charges"
 	"github.com/Akshats-git/PayCore/internal/config"
 	"github.com/Akshats-git/PayCore/internal/httpapi"
 	"github.com/Akshats-git/PayCore/internal/storage"
@@ -71,9 +72,19 @@ func run(logger *slog.Logger) error {
 		return nil
 	}
 
+	// Repositories and application services, wired to the connection pool.
+	accountRepo := storage.NewAccountRepo(pool)
+	ledgerRepo := storage.NewLedgerRepo(pool)
+	chargeService := charges.NewService(ledgerRepo)
+
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           httpapi.NewRouter(logger, ready),
+		Addr: cfg.Addr,
+		Handler: httpapi.NewRouter(httpapi.Deps{
+			Logger:   logger,
+			Ready:    ready,
+			Accounts: accountRepo,
+			Charges:  chargeService,
+		}),
 		ReadHeaderTimeout: 5 * time.Second, // basic protection against slow-header attacks
 	}
 

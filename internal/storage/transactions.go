@@ -3,13 +3,14 @@ package storage
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Akshats-git/PayCore/internal/ledger"
 )
 
-// LedgerRepo writes financial transactions to the ledger.
+// LedgerRepo writes and reads financial transactions in the ledger.
 type LedgerRepo struct {
 	pool *pgxpool.Pool
 }
@@ -17,6 +18,16 @@ type LedgerRepo struct {
 // NewLedgerRepo returns a LedgerRepo backed by the given connection pool.
 func NewLedgerRepo(pool *pgxpool.Pool) *LedgerRepo {
 	return &LedgerRepo{pool: pool}
+}
+
+// StoredTransaction is a transaction as it exists in the database: the
+// transactions row plus all of its ledger entries.
+type StoredTransaction struct {
+	ID        int64
+	Kind      ledger.Kind
+	Status    string
+	CreatedAt time.Time
+	Entries   []ledger.Entry
 }
 
 // Post validates a transaction and writes it — the transactions row together
@@ -67,4 +78,48 @@ func (r *LedgerRepo) Post(ctx context.Context, t ledger.Transaction) (int64, err
 		return 0, fmt.Errorf("commit: %w", err)
 	}
 	return txID, nil
+}
+
+// GetTransaction fetches one transaction and its entries by ID. If no such
+// transaction exists it returns an error wrapping pgx.ErrNoRows, so callers can
+// distinguish "not found" from a real failure with errors.Is.
+func (r *LedgerRepo) GetTransaction(ctx context.Context, id int64) (StoredTransaction, error) {
+	var (
+		st           StoredTransaction
+		kind, status string
+	)
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, kind, status, created_at FROM transactions WHERE id = $1`, id,
+	).Scan(&st.ID, &kind, &status, &st.CreatedAt)
+	if err != nil {
+		return StoredTransaction{}, fmt.Errorf("get transaction %d: %w", id, err)
+	}
+	st.Kind = ledger.Kind(kind)
+	st.Status = status
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT account_id, direction, amount, currency
+		 FROM ledger_entries WHERE transaction_id = $1 ORDER BY id`, id)
+	if err != nil {
+		return StoredTransaction{}, fmt.Errorf("get entries for %d: %w", id, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			e   ledger.Entry
+			dir string
+			amt int64
+		)
+		if err := rows.Scan(&e.AccountID, &dir, &amt, &e.Currency); err != nil {
+			return StoredTransaction{}, fmt.Errorf("scan entry: %w", err)
+		}
+		e.Direction = ledger.Direction(dir)
+		e.Amount = ledger.Money(amt)
+		st.Entries = append(st.Entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return StoredTransaction{}, fmt.Errorf("iterate entries: %w", err)
+	}
+	return st, nil
 }

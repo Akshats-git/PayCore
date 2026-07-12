@@ -14,19 +14,33 @@ import (
 // the first dependency that is not.
 type ReadinessFunc func(ctx context.Context) error
 
+// Deps bundles everything the router needs to build its handlers. Grouping them
+// in a struct keeps NewRouter's signature stable as the API surface grows.
+type Deps struct {
+	Logger   *slog.Logger
+	Ready    ReadinessFunc
+	Accounts AccountService
+	Charges  ChargeService
+}
+
 // NewRouter returns the top-level HTTP handler for the service. Every route the
 // service exposes is registered here, so this function is the one place to look
 // to see the whole API surface.
-func NewRouter(logger *slog.Logger, ready ReadinessFunc) http.Handler {
+func NewRouter(d Deps) http.Handler {
 	mux := http.NewServeMux()
 
-	// Liveness vs readiness are different questions (see the handlers below).
+	// Health.
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /readyz", handleReadyz(logger, ready))
+	mux.HandleFunc("GET /readyz", handleReadyz(d.Logger, d.Ready))
+
+	// Accounts and charges.
+	mux.HandleFunc("POST /v1/accounts", handleCreateAccount(d.Logger, d.Accounts))
+	mux.HandleFunc("POST /v1/charges", handleCreateCharge(d.Logger, d.Charges))
+	mux.HandleFunc("GET /v1/charges/{id}", handleGetCharge(d.Logger, d.Charges))
 
 	// Middleware wraps the entire mux: a request flows through logRequests
 	// first, then into whichever handler the mux matches.
-	return logRequests(logger, mux)
+	return logRequests(d.Logger, mux)
 }
 
 // handleHealthz is a *liveness* probe: it returns 200 as long as the process is
@@ -39,11 +53,9 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 // handleReadyz is a *readiness* probe: it returns 200 only if the service can
 // actually do its job, which means its dependencies (Postgres, Redis) are
 // reachable. If this fails, the right response is to stop sending the process
-// traffic (pull it from the load balancer) — but NOT to restart it, since the
-// process itself is fine and the dependency may simply be recovering.
+// traffic (pull it from the load balancer) — but NOT to restart it.
 func handleReadyz(logger *slog.Logger, ready ReadinessFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Bound the check so a hung dependency can't make readyz hang too.
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 
@@ -57,12 +69,15 @@ func handleReadyz(logger *slog.Logger, ready ReadinessFunc) http.HandlerFunc {
 }
 
 // writeJSON serializes body as JSON and writes it with the given status code.
-// Centralizing this keeps every response consistently Content-Type'd and gives
-// us a single place to evolve response formatting later.
 func writeJSON(w http.ResponseWriter, code int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// writeError writes a JSON error body ({"error": msg}) with the given status.
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
 }
 
 // logRequests is a minimal middleware that records one structured log line per
