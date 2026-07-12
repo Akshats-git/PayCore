@@ -1,5 +1,7 @@
 # PayCore
 
+[![CI](https://github.com/Akshats-git/PayCore/actions/workflows/ci.yml/badge.svg)](https://github.com/Akshats-git/PayCore/actions/workflows/ci.yml)
+
 A mini payment processing engine that moves money between accounts **correctly under concurrency, crashes, and load** — the hard problems real payment infrastructure is built to survive.
 
 The goal is *provable* correctness of money movement, not feature count.

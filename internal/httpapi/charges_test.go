@@ -67,10 +67,10 @@ func TestCreateChargeValidationErrors(t *testing.T) {
 	}}
 
 	cases := map[string]string{
-		"bad json":          `{not json`,
+		"bad json":            `{not json`,
 		"non-positive amount": `{"from_account":1,"to_account":2,"amount":0,"currency":"INR"}`,
-		"same account":      `{"from_account":1,"to_account":1,"amount":100,"currency":"INR"}`,
-		"missing currency":  `{"from_account":1,"to_account":2,"amount":100,"currency":""}`,
+		"same account":        `{"from_account":1,"to_account":1,"amount":100,"currency":"INR"}`,
+		"missing currency":    `{"from_account":1,"to_account":2,"amount":100,"currency":""}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

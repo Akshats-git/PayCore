@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # A throwaway Postgres for the integration tests. GitHub waits for the
+    # health check to pass before running any step, so the database is
+    # guaranteed to be accepting connections by the time `go test` starts.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: paycore
+          POSTGRES_PASSWORD: paycore
+          POSTGRES_DB: paycore
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U paycore"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # On a clean CI runner 5432 is free, so we use the default port here
+      # (5433 was only a local workaround for an already-running Postgres).
+      PAYCORE_TEST_DATABASE_URL: postgres://paycore:paycore@localhost:5432/paycore?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # keep CI on the same Go version as the module
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # -race catches data races (essential for the concurrency test in Phase 2);
+      # -p 1 serializes the package test binaries so the integration tests don't
+      # race each other on the shared database.
+      - name: Test
+        run: go test -race -p 1 ./...
