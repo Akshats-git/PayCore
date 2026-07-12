@@ -62,6 +62,35 @@ func TestAccountRepoCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestAccountBalance(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	accounts := NewAccountRepo(pool)
+	ledgerRepo := NewLedgerRepo(pool)
+
+	from, _ := accounts.Create(ctx, "alice", ledger.Liability, "INR")
+	to, _ := accounts.Create(ctx, "bob", ledger.Liability, "INR")
+
+	// A brand-new account, with no entries, has a zero balance.
+	if b, err := accounts.Balance(ctx, from.ID); err != nil || b != 0 {
+		t.Fatalf("new account balance = %d (err %v), want 0", b, err)
+	}
+
+	// Move 500.00 from alice to bob.
+	if _, err := ledgerRepo.Post(ctx, ledger.NewTransfer(ledger.Charge, from.ID, to.ID, 50000, "INR")); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// balance = credits − debits: the debited payer goes negative, the credited
+	// payee goes positive, and together they net to zero.
+	if b, _ := accounts.Balance(ctx, from.ID); b != -50000 {
+		t.Fatalf("alice (payer) balance = %d, want -50000", b)
+	}
+	if b, _ := accounts.Balance(ctx, to.ID); b != 50000 {
+		t.Fatalf("bob (payee) balance = %d, want 50000", b)
+	}
+}
+
 func TestLedgerRepoPostWritesBalancedTransaction(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()

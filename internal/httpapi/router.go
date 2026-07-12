@@ -35,6 +35,7 @@ func NewRouter(d Deps) http.Handler {
 
 	// Accounts and charges.
 	mux.HandleFunc("POST /v1/accounts", handleCreateAccount(d.Logger, d.Accounts))
+	mux.HandleFunc("GET /v1/accounts/{id}", handleGetAccount(d.Logger, d.Accounts))
 	mux.HandleFunc("POST /v1/charges", handleCreateCharge(d.Logger, d.Charges))
 	mux.HandleFunc("GET /v1/charges/{id}", handleGetCharge(d.Logger, d.Charges))
 
