@@ -29,7 +29,7 @@ func testService(t *testing.T) (*Service, *storage.AccountRepo) {
 	}
 	t.Cleanup(pool.Close)
 	if _, err := pool.Exec(context.Background(),
-		`TRUNCATE accounts, transactions, ledger_entries RESTART IDENTITY CASCADE`); err != nil {
+		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	return NewService(storage.NewLedgerRepo(pool)), storage.NewAccountRepo(pool)
