@@ -22,6 +22,7 @@ type Deps struct {
 	Accounts    AccountService
 	Charges     ChargeService
 	RateLimiter RateLimiter // optional; nil disables rate limiting
+	Shedder     *Shedder    // optional; nil disables load shedding
 }
 
 // NewRouter returns the top-level HTTP handler for the service. Every route the
@@ -40,10 +41,15 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("POST /v1/charges", handleCreateCharge(d.Logger, d.Charges))
 	mux.HandleFunc("GET /v1/charges/{id}", handleGetCharge(d.Logger, d.Charges))
 
-	// Middleware wraps the mux from the inside out: rate limiting (if configured)
-	// runs before the handler, and logRequests wraps everything so even a
-	// rate-limited 429 is logged.
+	// Middleware wraps the mux from the inside out. A request flows:
+	//   logRequests → rate limit (per client) → load shed (whole system) → mux
+	// Rate limiting runs first so an abusive client is rejected before its
+	// requests count as in-flight load. logRequests wraps everything so even a
+	// rejected 429/503 is logged.
 	var handler http.Handler = mux
+	if d.Shedder != nil {
+		handler = d.Shedder.middleware(handler)
+	}
 	if d.RateLimiter != nil {
 		handler = rateLimitMiddleware(d.RateLimiter, d.Logger, handler)
 	}

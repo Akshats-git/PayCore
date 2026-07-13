@@ -81,8 +81,9 @@ func run(logger *slog.Logger) error {
 	accountService := accounts.NewService(accountRepo)
 	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo)
 
-	// Per-client rate limiting: allow a burst of 20, refilling at 10/sec.
-	limiter := ratelimit.NewLimiter(rdb, 20, 10)
+	// Overload protection: per-client rate limiting and whole-system load shedding.
+	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitCapacity, cfg.RateLimitRefillPerSec)
+	shedder := httpapi.NewShedder(cfg.LoadShedMaxInFlight)
 
 	srv := &http.Server{
 		Addr: cfg.Addr,
@@ -92,6 +93,7 @@ func run(logger *slog.Logger) error {
 			Accounts:    accountService,
 			Charges:     chargeService,
 			RateLimiter: limiter,
+			Shedder:     shedder,
 		}),
 		ReadHeaderTimeout: 5 * time.Second, // basic protection against slow-header attacks
 	}
