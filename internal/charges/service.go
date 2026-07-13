@@ -56,16 +56,26 @@ var (
 // a foreign key — here, when a charge references an account that doesn't exist.
 const pgForeignKeyViolation = "23503"
 
+// EventChargeSucceeded is the outbox event type emitted when a charge is created.
+const EventChargeSucceeded = "charge.succeeded"
+
+// chargeEvent is the JSON envelope stored in the outbox and later delivered.
+type chargeEvent struct {
+	Type string `json:"type"`
+	Data Charge `json:"data"`
+}
+
 // Service creates and reads charges.
 type Service struct {
 	pool        *pgxpool.Pool
 	ledger      *storage.LedgerRepo
 	idempotency *storage.IdempotencyRepo
+	outbox      *storage.OutboxRepo
 }
 
 // NewService returns a charge Service.
-func NewService(pool *pgxpool.Pool, ledgerRepo *storage.LedgerRepo, idempotencyRepo *storage.IdempotencyRepo) *Service {
-	return &Service{pool: pool, ledger: ledgerRepo, idempotency: idempotencyRepo}
+func NewService(pool *pgxpool.Pool, ledgerRepo *storage.LedgerRepo, idempotencyRepo *storage.IdempotencyRepo, outboxRepo *storage.OutboxRepo) *Service {
+	return &Service{pool: pool, ledger: ledgerRepo, idempotency: idempotencyRepo, outbox: outboxRepo}
 }
 
 // CreateIdempotent creates a charge under an idempotency key, or replays the
@@ -128,8 +138,19 @@ func (s *Service) CreateIdempotent(ctx context.Context, key string, rawBody []by
 		return 0, nil, fmt.Errorf("marshal charge: %w", err)
 	}
 
+	// Emit a webhook event in this SAME transaction (transactional outbox): the
+	// event and the charge commit together, so a charge can never exist without
+	// its event, nor an event without its charge.
+	event, err := json.Marshal(chargeEvent{Type: EventChargeSucceeded, Data: charge})
+	if err != nil {
+		return 0, nil, fmt.Errorf("marshal event: %w", err)
+	}
+	if _, err := s.outbox.Enqueue(ctx, tx, EventChargeSucceeded, event); err != nil {
+		return 0, nil, err
+	}
+
 	// Store the response so retries replay these exact bytes, then commit the
-	// claim, the charge, and the completion together.
+	// claim, the charge, the event, and the completion together.
 	if err := s.idempotency.Complete(ctx, tx, key, http.StatusCreated, body, &txID); err != nil {
 		return 0, nil, err
 	}

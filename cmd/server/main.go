@@ -78,8 +78,9 @@ func run(logger *slog.Logger) error {
 	accountRepo := storage.NewAccountRepo(pool)
 	ledgerRepo := storage.NewLedgerRepo(pool)
 	idempotencyRepo := storage.NewIdempotencyRepo(pool)
+	outboxRepo := storage.NewOutboxRepo(pool)
 	accountService := accounts.NewService(accountRepo)
-	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo)
+	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo, outboxRepo)
 
 	// Overload protection: per-client rate limiting and whole-system load shedding.
 	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitCapacity, cfg.RateLimitRefillPerSec)

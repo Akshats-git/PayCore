@@ -2,6 +2,7 @@ package charges
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"testing"
@@ -31,10 +32,10 @@ func testService(t *testing.T) (*Service, *storage.AccountRepo) {
 	}
 	t.Cleanup(pool.Close)
 	if _, err := pool.Exec(context.Background(),
-		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys RESTART IDENTITY CASCADE`); err != nil {
+		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys, outbox RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	svc := NewService(pool, storage.NewLedgerRepo(pool), storage.NewIdempotencyRepo(pool))
+	svc := NewService(pool, storage.NewLedgerRepo(pool), storage.NewIdempotencyRepo(pool), storage.NewOutboxRepo(pool))
 	return svc, storage.NewAccountRepo(pool)
 }
 
@@ -185,4 +186,60 @@ func transactionCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int
 		t.Fatalf("count transactions: %v", err)
 	}
 	return n
+}
+
+func TestCreateIdempotentWritesOutboxEvent(t *testing.T) {
+	svc, accounts := testService(t)
+	ctx := context.Background()
+
+	from, _ := accounts.Create(ctx, "alice", ledger.Liability, "INR")
+	to, _ := accounts.Create(ctx, "bob", ledger.Liability, "INR")
+
+	body := []byte(`{"from_account":1,"to_account":2,"amount":50000,"currency":"INR"}`)
+	req := CreateRequest{FromAccount: from.ID, ToAccount: to.ID, Amount: 50000, Currency: "INR"}
+
+	if _, _, err := svc.CreateIdempotent(ctx, "k-outbox", body, req); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Exactly one pending event of the right type was written — in the same
+	// transaction as the charge.
+	var (
+		count      int
+		eventType  string
+		status     string
+		payloadRaw []byte
+	)
+	if err := svc.pool.QueryRow(ctx, `SELECT count(*) FROM outbox`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("outbox events = %d, want 1", count)
+	}
+	if err := svc.pool.QueryRow(ctx,
+		`SELECT event_type, status, payload FROM outbox LIMIT 1`).Scan(&eventType, &status, &payloadRaw); err != nil {
+		t.Fatal(err)
+	}
+	if eventType != EventChargeSucceeded || status != storage.OutboxPending {
+		t.Fatalf("event_type=%q status=%q, want %q/pending", eventType, status, EventChargeSucceeded)
+	}
+
+	var env chargeEvent
+	if err := json.Unmarshal(payloadRaw, &env); err != nil {
+		t.Fatalf("payload is not valid event JSON: %v", err)
+	}
+	if env.Type != EventChargeSucceeded || env.Data.Amount != 50000 {
+		t.Fatalf("payload envelope = %+v, want type %q amount 50000", env, EventChargeSucceeded)
+	}
+
+	// A replay of the same key must NOT enqueue a second event.
+	if _, _, err := svc.CreateIdempotent(ctx, "k-outbox", body, req); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if err := svc.pool.QueryRow(ctx, `SELECT count(*) FROM outbox`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("after replay, outbox events = %d, want still 1 (no duplicate)", count)
+	}
 }

@@ -34,7 +34,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	if _, err := pool.Exec(context.Background(),
-		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys RESTART IDENTITY CASCADE`); err != nil {
+		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys, outbox RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	return pool

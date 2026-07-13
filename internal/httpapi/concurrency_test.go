@@ -43,7 +43,7 @@ func TestConcurrentIdenticalChargesCreateExactlyOne(t *testing.T) {
 	}
 	defer pool.Close()
 	if _, err := pool.Exec(ctx,
-		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys RESTART IDENTITY CASCADE`); err != nil {
+		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys, outbox RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -55,7 +55,7 @@ func TestConcurrentIdenticalChargesCreateExactlyOne(t *testing.T) {
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Ready:    func(context.Context) error { return nil },
 		Accounts: accounts.NewService(accountRepo),
-		Charges:  charges.NewService(pool, ledgerRepo, idempotencyRepo),
+		Charges:  charges.NewService(pool, ledgerRepo, idempotencyRepo, storage.NewOutboxRepo(pool)),
 	})
 	server := httptest.NewServer(router)
 	defer server.Close()
