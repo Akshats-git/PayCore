@@ -81,6 +81,15 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// writeRaw writes pre-serialized JSON bytes with the given status. It's used to
+// send an idempotent response byte-for-byte, whether freshly produced or replayed
+// from storage.
+func writeRaw(w http.ResponseWriter, code int, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write(body)
+}
+
 // logRequests is a minimal middleware that records one structured log line per
 // request after it completes. Middleware in Go is just a function that takes an
 // http.Handler and returns a wrapped http.Handler.

@@ -76,8 +76,9 @@ func run(logger *slog.Logger) error {
 	// Repositories and application services, wired to the connection pool.
 	accountRepo := storage.NewAccountRepo(pool)
 	ledgerRepo := storage.NewLedgerRepo(pool)
+	idempotencyRepo := storage.NewIdempotencyRepo(pool)
 	accountService := accounts.NewService(accountRepo)
-	chargeService := charges.NewService(ledgerRepo)
+	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo)
 
 	srv := &http.Server{
 		Addr: cfg.Addr,

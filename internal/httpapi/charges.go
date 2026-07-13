@@ -4,19 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/Akshats-git/PayCore/internal/charges"
 	"github.com/Akshats-git/PayCore/internal/ledger"
 )
 
+// maxChargeBodyBytes caps how much of a request body we'll read, so a giant body
+// can't exhaust memory.
+const maxChargeBodyBytes = 64 << 10 // 64 KiB
+
 // ChargeService is the slice of charge behavior the HTTP layer needs.
-// *charges.Service satisfies it.
+// *charges.Service satisfies it. CreateIdempotent returns the status code and
+// response body to send (identical on the first call and every retry).
 type ChargeService interface {
-	Create(ctx context.Context, fromAccount, toAccount int64, amount ledger.Money, currency string) (charges.Charge, error)
+	CreateIdempotent(ctx context.Context, key string, rawBody []byte, req charges.CreateRequest) (int, []byte, error)
 	Get(ctx context.Context, id int64) (charges.Charge, error)
 }
 
@@ -27,32 +32,24 @@ type createChargeRequest struct {
 	Currency    string `json:"currency"`
 }
 
-type chargeResponse struct {
-	ID          int64     `json:"id"`
-	FromAccount int64     `json:"from_account"`
-	ToAccount   int64     `json:"to_account"`
-	Amount      int64     `json:"amount"`
-	Currency    string    `json:"currency"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-}
-
-func toChargeResponse(c charges.Charge) chargeResponse {
-	return chargeResponse{
-		ID:          c.ID,
-		FromAccount: c.FromAccount,
-		ToAccount:   c.ToAccount,
-		Amount:      int64(c.Amount),
-		Currency:    c.Currency,
-		Status:      c.Status,
-		CreatedAt:   c.CreatedAt,
-	}
-}
-
 func handleCreateCharge(logger *slog.Logger, svc ChargeService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Every charge must carry an idempotency key so retries are always safe.
+		key := r.Header.Get("Idempotency-Key")
+		if key == "" {
+			writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+			return
+		}
+
+		// Read the raw bytes: we both hash them (for idempotency) and parse them.
+		rawBody, err := io.ReadAll(io.LimitReader(r.Body, maxChargeBodyBytes))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "could not read request body")
+			return
+		}
+
 		var req createChargeRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.Unmarshal(rawBody, &req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -69,18 +66,28 @@ func handleCreateCharge(logger *slog.Logger, svc ChargeService) http.HandlerFunc
 			return
 		}
 
-		c, err := svc.Create(r.Context(), req.FromAccount, req.ToAccount, ledger.Money(req.Amount), req.Currency)
+		code, body, err := svc.CreateIdempotent(r.Context(), key, rawBody, charges.CreateRequest{
+			FromAccount: req.FromAccount,
+			ToAccount:   req.ToAccount,
+			Amount:      ledger.Money(req.Amount),
+			Currency:    req.Currency,
+		})
 		if err != nil {
 			switch {
 			case errors.Is(err, charges.ErrAccountNotFound):
 				writeError(w, http.StatusUnprocessableEntity, "from_account or to_account does not exist")
+			case errors.Is(err, charges.ErrKeyConflict):
+				writeError(w, http.StatusUnprocessableEntity, "Idempotency-Key was already used with a different request")
+			case errors.Is(err, charges.ErrKeyInProgress):
+				writeError(w, http.StatusConflict, "a request with this Idempotency-Key is still in progress")
 			default:
 				logger.Error("create charge failed", "err", err)
 				writeError(w, http.StatusInternalServerError, "internal error")
 			}
 			return
 		}
-		writeJSON(w, http.StatusCreated, toChargeResponse(c))
+		// Write the exact bytes the service produced (and stored for replay).
+		writeRaw(w, code, body)
 	}
 }
 
@@ -101,6 +108,6 @@ func handleGetCharge(logger *slog.Logger, svc ChargeService) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		writeJSON(w, http.StatusOK, toChargeResponse(c))
+		writeJSON(w, http.StatusOK, c)
 	}
 }

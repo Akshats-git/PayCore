@@ -2,26 +2,23 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Akshats-git/PayCore/internal/charges"
-	"github.com/Akshats-git/PayCore/internal/ledger"
 )
 
 // fakeChargeService is an in-memory ChargeService so the HTTP handlers can be
 // tested with no database.
 type fakeChargeService struct {
-	createFn func(ctx context.Context, from, to int64, amount ledger.Money, currency string) (charges.Charge, error)
+	createFn func(ctx context.Context, key string, rawBody []byte, req charges.CreateRequest) (int, []byte, error)
 	getFn    func(ctx context.Context, id int64) (charges.Charge, error)
 }
 
-func (f fakeChargeService) Create(ctx context.Context, from, to int64, amount ledger.Money, currency string) (charges.Charge, error) {
-	return f.createFn(ctx, from, to, amount, currency)
+func (f fakeChargeService) CreateIdempotent(ctx context.Context, key string, rawBody []byte, req charges.CreateRequest) (int, []byte, error) {
+	return f.createFn(ctx, key, rawBody, req)
 }
 
 func (f fakeChargeService) Get(ctx context.Context, id int64) (charges.Charge, error) {
@@ -32,40 +29,56 @@ func chargeRouter(svc ChargeService) http.Handler {
 	return NewRouter(Deps{Logger: discardLogger(), Ready: alwaysReady, Charges: svc})
 }
 
-func postCharge(t *testing.T, svc ChargeService, body string) *httptest.ResponseRecorder {
+// postCharge sends a POST /v1/charges, setting the Idempotency-Key header unless
+// key is empty.
+func postCharge(t *testing.T, svc ChargeService, key, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/charges", strings.NewReader(body))
+	if key != "" {
+		req.Header.Set("Idempotency-Key", key)
+	}
 	rec := httptest.NewRecorder()
 	chargeRouter(svc).ServeHTTP(rec, req)
 	return rec
 }
 
+// validBody is a well-formed charge request used where the request itself isn't
+// the thing under test.
+const validBody = `{"from_account":1,"to_account":2,"amount":50000,"currency":"INR"}`
+
 func TestCreateChargeSuccess(t *testing.T) {
-	svc := fakeChargeService{createFn: func(_ context.Context, from, to int64, amount ledger.Money, currency string) (charges.Charge, error) {
-		return charges.Charge{ID: 42, FromAccount: from, ToAccount: to, Amount: amount, Currency: currency, Status: "succeeded", CreatedAt: time.Now()}, nil
+	stored := []byte(`{"id":42,"from_account":1,"to_account":2,"amount":50000,"currency":"INR","status":"succeeded"}`)
+	svc := fakeChargeService{createFn: func(_ context.Context, key string, _ []byte, _ charges.CreateRequest) (int, []byte, error) {
+		if key != "abc123" {
+			t.Errorf("handler passed key %q, want abc123", key)
+		}
+		return http.StatusCreated, stored, nil
 	}}
 
-	rec := postCharge(t, svc, `{"from_account":1,"to_account":2,"amount":50000,"currency":"INR"}`)
+	rec := postCharge(t, svc, "abc123", validBody)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
 	}
-	var resp chargeResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
+	if rec.Body.String() != string(stored) {
+		t.Fatalf("body = %s, want the exact stored bytes %s", rec.Body.String(), stored)
 	}
-	if resp.ID != 42 || resp.Amount != 50000 || resp.FromAccount != 1 || resp.ToAccount != 2 {
-		t.Fatalf("unexpected response: %+v", resp)
+}
+
+func TestCreateChargeMissingIdempotencyKey(t *testing.T) {
+	panicSvc := fakeChargeService{createFn: func(context.Context, string, []byte, charges.CreateRequest) (int, []byte, error) {
+		panic("service should not be called without an idempotency key")
+	}}
+	rec := postCharge(t, panicSvc, "", validBody)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 
 func TestCreateChargeValidationErrors(t *testing.T) {
-	// Each of these should be rejected with 400 *before* the service is called,
-	// so a service that panics if invoked proves the request never reached it.
-	panicSvc := fakeChargeService{createFn: func(context.Context, int64, int64, ledger.Money, string) (charges.Charge, error) {
+	panicSvc := fakeChargeService{createFn: func(context.Context, string, []byte, charges.CreateRequest) (int, []byte, error) {
 		panic("service should not be called for an invalid request")
 	}}
-
 	cases := map[string]string{
 		"bad json":            `{not json`,
 		"non-positive amount": `{"from_account":1,"to_account":2,"amount":0,"currency":"INR"}`,
@@ -74,7 +87,7 @@ func TestCreateChargeValidationErrors(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			rec := postCharge(t, panicSvc, body)
+			rec := postCharge(t, panicSvc, "key", body)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400", rec.Code)
 			}
@@ -82,15 +95,26 @@ func TestCreateChargeValidationErrors(t *testing.T) {
 	}
 }
 
-func TestCreateChargeAccountNotFound(t *testing.T) {
-	svc := fakeChargeService{createFn: func(context.Context, int64, int64, ledger.Money, string) (charges.Charge, error) {
-		return charges.Charge{}, charges.ErrAccountNotFound
-	}}
-
-	rec := postCharge(t, svc, `{"from_account":1,"to_account":2,"amount":100,"currency":"INR"}`)
-
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422", rec.Code)
+func TestCreateChargeErrorMapping(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+	}{
+		{"account not found", charges.ErrAccountNotFound, http.StatusUnprocessableEntity},
+		{"key conflict", charges.ErrKeyConflict, http.StatusUnprocessableEntity},
+		{"key in progress", charges.ErrKeyInProgress, http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := fakeChargeService{createFn: func(context.Context, string, []byte, charges.CreateRequest) (int, []byte, error) {
+				return 0, nil, tc.err
+			}}
+			rec := postCharge(t, svc, "key", validBody)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantCode)
+			}
+		})
 	}
 }
 
@@ -106,12 +130,8 @@ func TestGetChargeSuccess(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	var resp chargeResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.ID != 7 {
-		t.Fatalf("id = %d, want 7", resp.ID)
+	if !strings.Contains(rec.Body.String(), `"id":7`) {
+		t.Fatalf("body %s does not contain id 7", rec.Body.String())
 	}
 }
 

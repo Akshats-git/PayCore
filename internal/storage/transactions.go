@@ -30,59 +30,67 @@ type StoredTransaction struct {
 	Entries   []ledger.Entry
 }
 
-// Post validates a transaction and writes it — the transactions row together
-// with all of its ledger_entries — inside a SINGLE database transaction. Either
-// everything commits or nothing does. This is the guarantee that a charge can
-// never be left half-written: if the process dies, the network drops, or any
-// single insert fails, Postgres rolls the whole thing back and the ledger is
-// exactly as it was before.
+// PostTx validates a transaction and writes it — the transactions row and all of
+// its entries — using q, which may be the pool or, for an idempotent charge, a
+// caller's already-open transaction. It does NOT begin or commit; that is the
+// caller's responsibility. It returns the new transaction's ID and creation time.
 //
-// It returns the new transaction's ID.
-func (r *LedgerRepo) Post(ctx context.Context, t ledger.Transaction) (int64, error) {
-	// Guard at the door: never even open a database transaction for something
-	// the domain rules already reject.
+// Taking a Querier is what lets the idempotency claim, the charge, and the
+// key-completion all happen inside one transaction and commit together.
+func (r *LedgerRepo) PostTx(ctx context.Context, q Querier, t ledger.Transaction) (int64, time.Time, error) {
 	if err := t.Validate(); err != nil {
-		return 0, fmt.Errorf("invalid transaction: %w", err)
+		return 0, time.Time{}, fmt.Errorf("invalid transaction: %w", err)
 	}
 
-	dbtx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin: %w", err)
-	}
-	// Rollback is a no-op once Commit has succeeded, so this safely undoes
-	// everything on any early return below (all of which are error paths).
-	defer func() { _ = dbtx.Rollback(ctx) }()
-
-	var txID int64
-	err = dbtx.QueryRow(ctx,
-		`INSERT INTO transactions (kind, status) VALUES ($1, 'succeeded') RETURNING id`,
+	var (
+		id        int64
+		createdAt time.Time
+	)
+	if err := q.QueryRow(ctx,
+		`INSERT INTO transactions (kind, status) VALUES ($1, 'succeeded') RETURNING id, created_at`,
 		string(t.Kind),
-	).Scan(&txID)
-	if err != nil {
-		return 0, fmt.Errorf("insert transaction: %w", err)
+	).Scan(&id, &createdAt); err != nil {
+		return 0, time.Time{}, fmt.Errorf("insert transaction: %w", err)
 	}
 
 	for _, e := range t.Entries {
-		if _, err := dbtx.Exec(ctx,
+		if _, err := q.Exec(ctx,
 			`INSERT INTO ledger_entries (transaction_id, account_id, direction, amount, currency)
 			 VALUES ($1, $2, $3, $4, $5)`,
-			txID, e.AccountID, string(e.Direction), int64(e.Amount), e.Currency,
+			id, e.AccountID, string(e.Direction), int64(e.Amount), e.Currency,
 		); err != nil {
-			return 0, fmt.Errorf("insert entry for account %d: %w", e.AccountID, err)
+			return 0, time.Time{}, fmt.Errorf("insert entry for account %d: %w", e.AccountID, err)
 		}
 	}
+	return id, createdAt, nil
+}
 
-	// The deferred balance trigger (migration 0002) runs here, at COMMIT, and
-	// will reject the transaction if the entries somehow don't balance.
-	if err := dbtx.Commit(ctx); err != nil {
+// Post writes a transaction atomically in its own database transaction: begin,
+// insert everything, commit. Either all of it lands or none does. Use this for
+// the non-idempotent path; the idempotent charge path calls PostTx inside a
+// transaction it manages itself.
+func (r *LedgerRepo) Post(ctx context.Context, t ledger.Transaction) (int64, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	// Rollback is a no-op once Commit has succeeded.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	id, _, err := r.PostTx(ctx, tx, t)
+	if err != nil {
+		return 0, err
+	}
+
+	// The deferred balance trigger (migration 0002) runs here, at COMMIT.
+	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit: %w", err)
 	}
-	return txID, nil
+	return id, nil
 }
 
 // GetTransaction fetches one transaction and its entries by ID. If no such
-// transaction exists it returns an error wrapping pgx.ErrNoRows, so callers can
-// distinguish "not found" from a real failure with errors.Is.
+// transaction exists it returns an error wrapping pgx.ErrNoRows.
 func (r *LedgerRepo) GetTransaction(ctx context.Context, id int64) (StoredTransaction, error) {
 	var (
 		st           StoredTransaction
