@@ -18,6 +18,7 @@ import (
 	"github.com/Akshats-git/PayCore/internal/httpapi"
 	"github.com/Akshats-git/PayCore/internal/ratelimit"
 	"github.com/Akshats-git/PayCore/internal/storage"
+	"github.com/Akshats-git/PayCore/internal/webhook"
 	"github.com/Akshats-git/PayCore/migrations"
 )
 
@@ -85,6 +86,17 @@ func run(logger *slog.Logger) error {
 	// Overload protection: per-client rate limiting and whole-system load shedding.
 	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitCapacity, cfg.RateLimitRefillPerSec)
 	shedder := httpapi.NewShedder(cfg.LoadShedMaxInFlight)
+
+	// Webhook delivery worker: drains the outbox to the configured receiver.
+	if cfg.WebhookURL != "" {
+		sender := webhook.NewHTTPSender(cfg.WebhookURL, []byte(cfg.WebhookSecret), &http.Client{Timeout: 10 * time.Second})
+		workerCtx, cancelWorker := context.WithCancel(context.Background())
+		defer cancelWorker()
+		go webhook.NewWorker(outboxRepo, sender, logger).Run(workerCtx)
+		logger.Info("webhook delivery worker started", "url", cfg.WebhookURL)
+	} else {
+		logger.Info("webhook delivery disabled (set PAYCORE_WEBHOOK_URL to enable)")
+	}
 
 	srv := &http.Server{
 		Addr: cfg.Addr,

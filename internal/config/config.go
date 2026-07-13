@@ -25,6 +25,12 @@ type Config struct {
 	// LoadShedMaxInFlight is the number of concurrent in-flight requests above
 	// which non-critical requests start being shed.
 	LoadShedMaxInFlight int
+
+	// WebhookURL is where charge events are delivered. If empty, the delivery
+	// worker is disabled and events simply accumulate in the outbox.
+	WebhookURL string
+	// WebhookSecret signs webhook payloads (HMAC-SHA256).
+	WebhookSecret string
 }
 
 // Load reads configuration from the environment, applying local-dev defaults so
@@ -39,6 +45,9 @@ func Load() Config {
 		RateLimitCapacity:     getenvInt("PAYCORE_RATE_LIMIT_CAPACITY", 20),
 		RateLimitRefillPerSec: getenvFloat("PAYCORE_RATE_LIMIT_REFILL_PER_SEC", 10),
 		LoadShedMaxInFlight:   getenvInt("PAYCORE_LOAD_SHED_MAX_INFLIGHT", 100),
+
+		WebhookURL:    getenv("PAYCORE_WEBHOOK_URL", ""),
+		WebhookSecret: getenv("PAYCORE_WEBHOOK_SECRET", "dev-webhook-secret"),
 	}
 }
 
