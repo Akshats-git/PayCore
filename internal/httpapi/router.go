@@ -17,10 +17,11 @@ type ReadinessFunc func(ctx context.Context) error
 // Deps bundles everything the router needs to build its handlers. Grouping them
 // in a struct keeps NewRouter's signature stable as the API surface grows.
 type Deps struct {
-	Logger   *slog.Logger
-	Ready    ReadinessFunc
-	Accounts AccountService
-	Charges  ChargeService
+	Logger      *slog.Logger
+	Ready       ReadinessFunc
+	Accounts    AccountService
+	Charges     ChargeService
+	RateLimiter RateLimiter // optional; nil disables rate limiting
 }
 
 // NewRouter returns the top-level HTTP handler for the service. Every route the
@@ -39,9 +40,14 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("POST /v1/charges", handleCreateCharge(d.Logger, d.Charges))
 	mux.HandleFunc("GET /v1/charges/{id}", handleGetCharge(d.Logger, d.Charges))
 
-	// Middleware wraps the entire mux: a request flows through logRequests
-	// first, then into whichever handler the mux matches.
-	return logRequests(d.Logger, mux)
+	// Middleware wraps the mux from the inside out: rate limiting (if configured)
+	// runs before the handler, and logRequests wraps everything so even a
+	// rate-limited 429 is logged.
+	var handler http.Handler = mux
+	if d.RateLimiter != nil {
+		handler = rateLimitMiddleware(d.RateLimiter, d.Logger, handler)
+	}
+	return logRequests(d.Logger, handler)
 }
 
 // handleHealthz is a *liveness* probe: it returns 200 as long as the process is

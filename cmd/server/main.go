@@ -16,6 +16,7 @@ import (
 	"github.com/Akshats-git/PayCore/internal/charges"
 	"github.com/Akshats-git/PayCore/internal/config"
 	"github.com/Akshats-git/PayCore/internal/httpapi"
+	"github.com/Akshats-git/PayCore/internal/ratelimit"
 	"github.com/Akshats-git/PayCore/internal/storage"
 	"github.com/Akshats-git/PayCore/migrations"
 )
@@ -80,13 +81,17 @@ func run(logger *slog.Logger) error {
 	accountService := accounts.NewService(accountRepo)
 	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo)
 
+	// Per-client rate limiting: allow a burst of 20, refilling at 10/sec.
+	limiter := ratelimit.NewLimiter(rdb, 20, 10)
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewRouter(httpapi.Deps{
-			Logger:   logger,
-			Ready:    ready,
-			Accounts: accountService,
-			Charges:  chargeService,
+			Logger:      logger,
+			Ready:       ready,
+			Accounts:    accountService,
+			Charges:     chargeService,
+			RateLimiter: limiter,
 		}),
 		ReadHeaderTimeout: 5 * time.Second, // basic protection against slow-header attacks
 	}
