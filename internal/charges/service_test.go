@@ -5,6 +5,9 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Akshats-git/PayCore/internal/ledger"
 	"github.com/Akshats-git/PayCore/internal/storage"
@@ -120,4 +123,66 @@ func TestCreateIdempotentSameKeyDifferentBody(t *testing.T) {
 	if !errors.Is(err, ErrKeyConflict) {
 		t.Fatalf("expected ErrKeyConflict for a reused key with a different body, got %v", err)
 	}
+}
+
+// TestCreateIdempotentCrashRecovery proves the durability half of idempotency:
+// if a charge's transaction dies before COMMIT (a crash, a dropped connection),
+// the claim rolls back TOGETHER WITH the charge — because they share one
+// transaction — so no zombie "in_progress" key is left to block future retries.
+// A retry with the same key then creates exactly one charge.
+func TestCreateIdempotentCrashRecovery(t *testing.T) {
+	svc, accounts := testService(t)
+	ctx := context.Background()
+
+	from, _ := accounts.Create(ctx, "alice", ledger.Liability, "INR")
+	to, _ := accounts.Create(ctx, "bob", ledger.Liability, "INR")
+
+	const key = "crash-key"
+	body := []byte(`{"from_account":1,"to_account":2,"amount":50000,"currency":"INR"}`)
+	req := CreateRequest{FromAccount: from.ID, ToAccount: to.ID, Amount: 50000, Currency: "INR"}
+
+	// Simulate a charge that dies before commit: claim the key and write the
+	// charge inside a transaction, then roll back instead of committing — exactly
+	// what Postgres does to an uncommitted transaction when a process crashes.
+	tx, err := svc.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	won, _, err := svc.idempotency.Claim(ctx, tx, key, storage.HashRequest(body), time.Hour)
+	if err != nil || !won {
+		t.Fatalf("claim inside doomed tx: won=%v err=%v", won, err)
+	}
+	if _, _, err := svc.ledger.PostTx(ctx, tx, ledger.NewTransfer(ledger.Charge, from.ID, to.ID, 50000, "INR")); err != nil {
+		t.Fatalf("post inside doomed tx: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil { // the "crash": no commit ever happens
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// The crash left no trace — the claim and the charge both rolled back.
+	if n := transactionCount(t, ctx, svc.pool); n != 0 {
+		t.Fatalf("after crash, transactions = %d, want 0 (everything rolled back)", n)
+	}
+
+	// Retry with the same key. Because no key survived, this claims fresh and
+	// creates the charge — and only one.
+	code, _, err := svc.CreateIdempotent(ctx, key, body, req)
+	if err != nil || code != 201 {
+		t.Fatalf("retry after crash: code=%d err=%v", code, err)
+	}
+	if n := transactionCount(t, ctx, svc.pool); n != 1 {
+		t.Fatalf("after retry, transactions = %d, want exactly 1", n)
+	}
+	if bal, _ := accounts.Balance(ctx, to.ID); bal != 50000 {
+		t.Fatalf("payee balance = %d, want 50000 (exactly one charge)", bal)
+	}
+}
+
+func transactionCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM transactions`).Scan(&n); err != nil {
+		t.Fatalf("count transactions: %v", err)
+	}
+	return n
 }
