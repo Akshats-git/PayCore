@@ -87,15 +87,22 @@ func run(logger *slog.Logger) error {
 	// Risk engine: an inline fraud scorer on the charge path, wrapped in a
 	// latency budget and a circuit breaker so a slow or failing scorer degrades
 	// gracefully (fail-open) instead of ever delaying or rejecting a charge.
-	riskGuard := risk.NewGuard(
-		risk.RuleScorer{BlockAtOrAbove: ledger.Money(cfg.RiskBlockAtOrAbove)},
-		logger,
-		risk.GuardConfig{
-			Budget:           cfg.RiskLatencyBudget,
-			BreakerThreshold: cfg.RiskBreakerThreshold,
-			BreakerCooldown:  cfg.RiskBreakerCooldown,
-		},
-	)
+	// The primary scorer is the trained model (embedded artifact); if it can't
+	// be loaded we fall back to the amount-threshold heuristic rather than run
+	// unprotected.
+	var scorer risk.Scorer
+	if model, err := risk.NewModelScorer(); err != nil {
+		logger.Warn("trained risk model unavailable; falling back to rule scorer", "err", err)
+		scorer = risk.RuleScorer{BlockAtOrAbove: ledger.Money(cfg.RiskBlockAtOrAbove)}
+	} else {
+		scorer = model
+		logger.Info("risk model loaded")
+	}
+	riskGuard := risk.NewGuard(scorer, logger, risk.GuardConfig{
+		Budget:           cfg.RiskLatencyBudget,
+		BreakerThreshold: cfg.RiskBreakerThreshold,
+		BreakerCooldown:  cfg.RiskBreakerCooldown,
+	})
 	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo, outboxRepo, riskGuard)
 
 	// Overload protection: per-client rate limiting and whole-system load shedding.
