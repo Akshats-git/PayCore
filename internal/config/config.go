@@ -7,6 +7,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds all runtime configuration for the service.
@@ -31,6 +32,19 @@ type Config struct {
 	WebhookURL string
 	// WebhookSecret signs webhook payloads (HMAC-SHA256).
 	WebhookSecret string
+
+	// RiskBlockAtOrAbove is the charge amount (minor units) the heuristic scorer
+	// blocks at or above. Zero disables blocking.
+	RiskBlockAtOrAbove int
+	// RiskLatencyBudget is the max time the inline scorer gets to answer before
+	// the charge path gives up on it and degrades.
+	RiskLatencyBudget time.Duration
+	// RiskBreakerThreshold is how many consecutive scorer failures trip the
+	// circuit breaker open.
+	RiskBreakerThreshold int
+	// RiskBreakerCooldown is how long the breaker stays open before it admits a
+	// trial call.
+	RiskBreakerCooldown time.Duration
 }
 
 // Load reads configuration from the environment, applying local-dev defaults so
@@ -48,6 +62,11 @@ func Load() Config {
 
 		WebhookURL:    getenv("PAYCORE_WEBHOOK_URL", ""),
 		WebhookSecret: getenv("PAYCORE_WEBHOOK_SECRET", "dev-webhook-secret"),
+
+		RiskBlockAtOrAbove:   getenvInt("PAYCORE_RISK_BLOCK_AT_OR_ABOVE", 5_000_00),
+		RiskLatencyBudget:    getenvDuration("PAYCORE_RISK_LATENCY_BUDGET", 50*time.Millisecond),
+		RiskBreakerThreshold: getenvInt("PAYCORE_RISK_BREAKER_THRESHOLD", 5),
+		RiskBreakerCooldown:  getenvDuration("PAYCORE_RISK_BREAKER_COOLDOWN", 5*time.Second),
 	}
 }
 
@@ -73,6 +92,16 @@ func getenvFloat(key string, fallback float64) float64 {
 	if v := os.Getenv(key); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return fallback
+}
+
+// getenvDuration parses a Go duration string like "50ms" or "5s".
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
 	return fallback

@@ -23,6 +23,7 @@ import (
 	"github.com/Akshats-git/PayCore/internal/charges"
 	"github.com/Akshats-git/PayCore/internal/httpapi"
 	"github.com/Akshats-git/PayCore/internal/ledger"
+	"github.com/Akshats-git/PayCore/internal/risk"
 	"github.com/Akshats-git/PayCore/internal/storage"
 	"github.com/Akshats-git/PayCore/migrations"
 )
@@ -55,7 +56,7 @@ func TestConcurrentIdenticalChargesCreateExactlyOne(t *testing.T) {
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Ready:    func(context.Context) error { return nil },
 		Accounts: accounts.NewService(accountRepo),
-		Charges:  charges.NewService(pool, ledgerRepo, idempotencyRepo, storage.NewOutboxRepo(pool)),
+		Charges:  charges.NewService(pool, ledgerRepo, idempotencyRepo, storage.NewOutboxRepo(pool), risk.NewGuard(risk.RuleScorer{}, slog.New(slog.NewTextHandler(io.Discard, nil)), risk.GuardConfig{})),
 	})
 	server := httptest.NewServer(router)
 	defer server.Close()

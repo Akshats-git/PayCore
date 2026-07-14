@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Akshats-git/PayCore/internal/ledger"
+	"github.com/Akshats-git/PayCore/internal/risk"
 	"github.com/Akshats-git/PayCore/internal/storage"
 )
 
@@ -65,17 +66,34 @@ type chargeEvent struct {
 	Data Charge `json:"data"`
 }
 
+// declined is the API/stored body for a charge the risk engine rejected. It has
+// no id and no ledger transaction behind it: nothing moved.
+type declined struct {
+	Status    string `json:"status"` // always "declined"
+	Reason    string `json:"reason"`
+	RiskScore int    `json:"risk_score"`
+}
+
+// RiskAssessor scores a charge before it is posted. *risk.Guard implements it.
+// By contract Assess never returns an error: on any internal failure (timeout,
+// scorer down, breaker open) it degrades to a fail-open Decision, so scoring can
+// never break the charge path.
+type RiskAssessor interface {
+	Assess(ctx context.Context, req risk.Request) risk.Decision
+}
+
 // Service creates and reads charges.
 type Service struct {
 	pool        *pgxpool.Pool
 	ledger      *storage.LedgerRepo
 	idempotency *storage.IdempotencyRepo
 	outbox      *storage.OutboxRepo
+	risk        RiskAssessor
 }
 
 // NewService returns a charge Service.
-func NewService(pool *pgxpool.Pool, ledgerRepo *storage.LedgerRepo, idempotencyRepo *storage.IdempotencyRepo, outboxRepo *storage.OutboxRepo) *Service {
-	return &Service{pool: pool, ledger: ledgerRepo, idempotency: idempotencyRepo, outbox: outboxRepo}
+func NewService(pool *pgxpool.Pool, ledgerRepo *storage.LedgerRepo, idempotencyRepo *storage.IdempotencyRepo, outboxRepo *storage.OutboxRepo, riskAssessor RiskAssessor) *Service {
+	return &Service{pool: pool, ledger: ledgerRepo, idempotency: idempotencyRepo, outbox: outboxRepo, risk: riskAssessor}
 }
 
 // CreateIdempotent creates a charge under an idempotency key, or replays the
@@ -113,7 +131,34 @@ func (s *Service) CreateIdempotent(ctx context.Context, key string, rawBody []by
 		}
 	}
 
-	// We won the claim: create the charge in this same transaction.
+	// We won the claim. Score the charge for fraud BEFORE posting it. Assess
+	// enforces a latency budget and a circuit breaker internally and never
+	// errors — it degrades to allow — so this call can't stall or fail the
+	// charge path. A block is a terminal outcome, recorded under the same key so
+	// retries replay the decline instead of re-scoring.
+	decision := s.risk.Assess(ctx, risk.Request{
+		FromAccount: req.FromAccount,
+		ToAccount:   req.ToAccount,
+		Amount:      req.Amount,
+		Currency:    req.Currency,
+	})
+	if decision.Action == risk.ActionBlock {
+		body, err := json.Marshal(declined{Status: "declined", Reason: decision.Reason, RiskScore: decision.Score})
+		if err != nil {
+			return 0, nil, fmt.Errorf("marshal decline: %w", err)
+		}
+		// Record the decline under the key (nil charge id: no transaction) and
+		// commit. No ledger transfer and no outbox event — nothing happened.
+		if err := s.idempotency.Complete(ctx, tx, key, http.StatusPaymentRequired, body, nil); err != nil {
+			return 0, nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, nil, fmt.Errorf("commit decline: %w", err)
+		}
+		return http.StatusPaymentRequired, body, nil
+	}
+
+	// Approved: create the charge in this same transaction.
 	transfer := ledger.NewTransfer(ledger.Charge, req.FromAccount, req.ToAccount, req.Amount, req.Currency)
 	txID, createdAt, err := s.ledger.PostTx(ctx, tx, transfer)
 	if err != nil {

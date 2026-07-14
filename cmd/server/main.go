@@ -16,7 +16,9 @@ import (
 	"github.com/Akshats-git/PayCore/internal/charges"
 	"github.com/Akshats-git/PayCore/internal/config"
 	"github.com/Akshats-git/PayCore/internal/httpapi"
+	"github.com/Akshats-git/PayCore/internal/ledger"
 	"github.com/Akshats-git/PayCore/internal/ratelimit"
+	"github.com/Akshats-git/PayCore/internal/risk"
 	"github.com/Akshats-git/PayCore/internal/storage"
 	"github.com/Akshats-git/PayCore/internal/webhook"
 	"github.com/Akshats-git/PayCore/migrations"
@@ -81,7 +83,20 @@ func run(logger *slog.Logger) error {
 	idempotencyRepo := storage.NewIdempotencyRepo(pool)
 	outboxRepo := storage.NewOutboxRepo(pool)
 	accountService := accounts.NewService(accountRepo)
-	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo, outboxRepo)
+
+	// Risk engine: an inline fraud scorer on the charge path, wrapped in a
+	// latency budget and a circuit breaker so a slow or failing scorer degrades
+	// gracefully (fail-open) instead of ever delaying or rejecting a charge.
+	riskGuard := risk.NewGuard(
+		risk.RuleScorer{BlockAtOrAbove: ledger.Money(cfg.RiskBlockAtOrAbove)},
+		logger,
+		risk.GuardConfig{
+			Budget:           cfg.RiskLatencyBudget,
+			BreakerThreshold: cfg.RiskBreakerThreshold,
+			BreakerCooldown:  cfg.RiskBreakerCooldown,
+		},
+	)
+	chargeService := charges.NewService(pool, ledgerRepo, idempotencyRepo, outboxRepo, riskGuard)
 
 	// Overload protection: per-client rate limiting and whole-system load shedding.
 	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitCapacity, cfg.RateLimitRefillPerSec)

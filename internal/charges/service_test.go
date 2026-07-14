@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -11,9 +13,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Akshats-git/PayCore/internal/ledger"
+	"github.com/Akshats-git/PayCore/internal/risk"
 	"github.com/Akshats-git/PayCore/internal/storage"
 	"github.com/Akshats-git/PayCore/migrations"
 )
+
+// allowAllRisk is a risk assessor that approves every charge, used where a test
+// isn't exercising the risk gate itself. RuleScorer with no block threshold
+// never blocks.
+func allowAllRisk() *risk.Guard {
+	return risk.NewGuard(risk.RuleScorer{}, slog.New(slog.NewTextHandler(io.Discard, nil)), risk.GuardConfig{})
+}
 
 // testService wires a real Service and AccountRepo to the test database. It
 // skips when PAYCORE_TEST_DATABASE_URL is unset.
@@ -35,7 +45,7 @@ func testService(t *testing.T) (*Service, *storage.AccountRepo) {
 		`TRUNCATE accounts, transactions, ledger_entries, idempotency_keys, outbox RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	svc := NewService(pool, storage.NewLedgerRepo(pool), storage.NewIdempotencyRepo(pool), storage.NewOutboxRepo(pool))
+	svc := NewService(pool, storage.NewLedgerRepo(pool), storage.NewIdempotencyRepo(pool), storage.NewOutboxRepo(pool), allowAllRisk())
 	return svc, storage.NewAccountRepo(pool)
 }
 
@@ -176,6 +186,97 @@ func TestCreateIdempotentCrashRecovery(t *testing.T) {
 	}
 	if bal, _ := accounts.Balance(ctx, to.ID); bal != 50000 {
 		t.Fatalf("payee balance = %d, want 50000 (exactly one charge)", bal)
+	}
+}
+
+// withRisk returns a copy of svc that uses a different risk assessor, reusing
+// the same (already-truncated) database and repositories.
+func withRisk(svc *Service, assessor RiskAssessor) *Service {
+	return &Service{pool: svc.pool, ledger: svc.ledger, idempotency: svc.idempotency, outbox: svc.outbox, risk: assessor}
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// erroringScorer always fails, to exercise the guard's fail-open degradation.
+type erroringScorer struct{}
+
+func (erroringScorer) Score(context.Context, risk.Request) (risk.Decision, error) {
+	return risk.Decision{}, errors.New("scorer down")
+}
+
+func TestCreateIdempotentRiskBlock(t *testing.T) {
+	base, accounts := testService(t)
+	ctx := context.Background()
+
+	from, _ := accounts.Create(ctx, "alice", ledger.Liability, "INR")
+	to, _ := accounts.Create(ctx, "bob", ledger.Liability, "INR")
+
+	// A guard that blocks any charge (threshold of 1 minor unit).
+	blocking := risk.NewGuard(risk.RuleScorer{BlockAtOrAbove: 1}, discardLogger(), risk.GuardConfig{})
+	svc := withRisk(base, blocking)
+
+	body := []byte(`{"from_account":1,"to_account":2,"amount":50000,"currency":"INR"}`)
+	req := CreateRequest{FromAccount: from.ID, ToAccount: to.ID, Amount: 50000, Currency: "INR"}
+
+	code, resp, err := svc.CreateIdempotent(ctx, "blocked-key", body, req)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if code != 402 {
+		t.Fatalf("code = %d, want 402 (declined by risk)", code)
+	}
+
+	var d declined
+	if err := json.Unmarshal(resp, &d); err != nil {
+		t.Fatalf("decline body not JSON: %v", err)
+	}
+	if d.Status != "declined" {
+		t.Fatalf("status = %q, want declined", d.Status)
+	}
+
+	// A blocked charge moves no money and emits no event.
+	if n := transactionCount(t, ctx, svc.pool); n != 0 {
+		t.Fatalf("transactions = %d, want 0 (charge was blocked)", n)
+	}
+	var outboxCount int
+	if err := svc.pool.QueryRow(ctx, `SELECT count(*) FROM outbox`).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if outboxCount != 0 {
+		t.Fatalf("outbox events = %d, want 0 (nothing happened)", outboxCount)
+	}
+	if bal, _ := accounts.Balance(ctx, to.ID); bal != 0 {
+		t.Fatalf("payee balance = %d, want 0", bal)
+	}
+
+	// The decline is idempotent: a retry replays the exact same 402 response.
+	code2, resp2, err := svc.CreateIdempotent(ctx, "blocked-key", body, req)
+	if err != nil || code2 != code || string(resp2) != string(resp) {
+		t.Fatalf("replay mismatch: (%d,%s) vs (%d,%s) err=%v", code2, resp2, code, resp, err)
+	}
+}
+
+func TestCreateIdempotentRiskDegradesToAllow(t *testing.T) {
+	base, accounts := testService(t)
+	ctx := context.Background()
+
+	from, _ := accounts.Create(ctx, "alice", ledger.Liability, "INR")
+	to, _ := accounts.Create(ctx, "bob", ledger.Liability, "INR")
+
+	// The scorer is completely down. The guard must degrade to fail-open, so the
+	// charge still succeeds — a broken risk service can't take payments down.
+	guard := risk.NewGuard(erroringScorer{}, discardLogger(), risk.GuardConfig{Budget: time.Second})
+	svc := withRisk(base, guard)
+
+	body := []byte(`{"from_account":1,"to_account":2,"amount":50000,"currency":"INR"}`)
+	req := CreateRequest{FromAccount: from.ID, ToAccount: to.ID, Amount: 50000, Currency: "INR"}
+
+	code, _, err := svc.CreateIdempotent(ctx, "degrade-key", body, req)
+	if err != nil || code != 201 {
+		t.Fatalf("charge with scorer down: code=%d err=%v, want 201 (fail-open)", code, err)
+	}
+	if bal, _ := accounts.Balance(ctx, to.ID); bal != 50000 {
+		t.Fatalf("payee balance = %d, want 50000 (charge went through despite dead scorer)", bal)
 	}
 }
 
